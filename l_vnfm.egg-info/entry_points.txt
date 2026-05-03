@@ -1,0 +1,3 @@
+[console_scripts]
+vnfm-api = vnfm.main:app
+vnfm-worker = vnfm.conductor.worker:main

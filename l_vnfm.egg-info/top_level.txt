@@ -1,0 +1,2 @@
+vnfm
+vnfm-ui

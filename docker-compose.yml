@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: vnfm-postgres
+    environment:
+      POSTGRES_USER: vnfm
+      POSTGRES_PASSWORD: vnfm
+      POSTGRES_DB: vnfm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vnfm"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: vnfm-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: vnfm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  vnfm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vnfm-api
+    environment:
+      VNFM_DATABASE_URL: postgresql+asyncpg://vnfm:vnfm@postgres:5432/vnfm
+      VNFM_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      VNFM_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn vnfm.main:app --host 0.0.0.0 --port 8000 --reload
+
+  vnfm-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vnfm-worker
+    environment:
+      VNFM_DATABASE_URL: postgresql+asyncpg://vnfm:vnfm@postgres:5432/vnfm
+      VNFM_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      VNFM_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: python -m vnfm.conductor.worker
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  redis_data:

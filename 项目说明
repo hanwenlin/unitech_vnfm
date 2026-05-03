@@ -1,0 +1,36 @@
+ 项目构建已完成。以下是已交付内容的总结：
+
+  后端 (FastAPI)
+  - vnfm/db/models.py — 5 张核心表：VnfPackage、VnfInstance、VnfResource、VimAuth、LifecycleEvent
+  - vnfm/parser/parser.py — tosca-parser 封装与 VNFD 校验
+  - vnfm/drivers/ — Pluggy 插件规范 + K8s/OpenStack 驱动实现
+  - vnfm/conductor/ — RabbitMQ 消费者、异步 FSM 状态机、独立 Worker 入口
+  - vnfm/api/routes/ — 完整 REST 接口：认证、VNF 包、VNF 生命周期、VIM、WebSocket
+  - vnfm/main.py — 应用主入口，自动建表、注册驱动、启动 Conductor
+
+  前端 (Vue 3 + Element Plus)
+  - vnfm-ui/src/views/ — Dashboard、VNF 实例、VNF 包、VIM 管理、拓扑图、登录
+  - vnfm-ui/src/components/StatusBadge.vue — 呼吸灯状态指示（ACTIVE 绿、ERROR 红、PROCESSING 蓝、PENDING 黄）
+  - vnfm-ui/src/api/ws.ts — WebSocket 客户端，断线自动重连
+  - 实例列表页已集成 WebSocket 实时状态推送
+
+  部署与配置
+  - docker-compose.yml — PostgreSQL + RabbitMQ + Redis + API + Worker
+  - Dockerfile、.env.example、alembic 迁移配置
+  - examples/sample_vnfd.yaml — 示例 TOSCA 模板
+
+  快速启动
+  # 1. 基础设施
+  docker-compose up -d postgres rabbitmq redis
+
+  # 2. 后端
+  pip install -r requirements.txt
+  uvicorn vnfm.main:app --reload --port 8000
+
+  # 3. Worker（另开终端）
+  python -m vnfm.conductor.worker
+
+  # 4. 前端（另开终端）
+  cd vnfm-ui && npm install && npm run dev
+
+  默认账号 admin/admin，API 文档见 http://localhost:8000/docs。
