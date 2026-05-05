@@ -127,3 +127,16 @@ class LifecycleEvent(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow, sa_column=Column(DateTime, default=datetime.utcnow))
 
     vnf_instance: VnfInstance = Relationship(back_populates="lifecycle_events")
+
+
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    username: str = Field(max_length=128, unique=True, index=True)
+    hashed_password: str = Field(max_length=255)
+    role: str = Field(default="user", max_length=64)
+    tenant_id: Optional[str] = Field(default=None, max_length=255, index=True)
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, sa_column=Column(DateTime, default=datetime.utcnow))
+    updated_at: datetime = Field(default_factory=datetime.utcnow, sa_column=Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow))

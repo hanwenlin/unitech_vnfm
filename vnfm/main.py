@@ -3,11 +3,14 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from sqlmodel import select
 
 from vnfm.common.settings import settings
-from vnfm.db.session import engine
+from vnfm.db.session import engine, AsyncSessionLocal
 from vnfm.db.base import SQLModel
+from vnfm.db.models import User
 from vnfm.api.routes import auth, catalog, vnf_lcm, vim, ws
+from vnfm.api.auth.security import get_password_hash
 from vnfm.api.middleware.audit import AuditMiddleware
 from vnfm.api.middleware.tenant import TenantMiddleware
 from vnfm.drivers.manager import vim_manager
@@ -17,6 +20,29 @@ from vnfm.conductor.manager import conductor_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+async def _seed_bootstrap_admin() -> None:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(User).where(User.username == settings.bootstrap_admin_username)
+        )
+        if result.scalar_one_or_none():
+            return
+        admin = User(
+            username=settings.bootstrap_admin_username,
+            hashed_password=get_password_hash(settings.bootstrap_admin_password),
+            role="admin",
+            tenant_id=settings.bootstrap_admin_tenant,
+            is_active=True,
+        )
+        session.add(admin)
+        await session.commit()
+        logger.info(
+            "Bootstrap admin user '%s' created (tenant=%s).",
+            settings.bootstrap_admin_username,
+            settings.bootstrap_admin_tenant,
+        )
 
 
 @asynccontextmanager
@@ -30,6 +56,8 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     logger.info("Database tables created.")
+
+    await _seed_bootstrap_admin()
 
     logger.info("Starting conductor manager...")
     await conductor_manager.start()

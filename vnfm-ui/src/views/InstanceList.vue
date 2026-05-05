@@ -91,12 +91,18 @@ const scaleForm = ref({ type: 'scale_out' })
 
 onMounted(async () => {
   loading.value = true
-  await store.fetchInstances()
-  const pkgRes = await api.get('/catalog/vnf_packages', { params: { page_size: 1000 } })
-  packages.value = pkgRes.data.items
-  const vimRes = await api.get('/vim/vim_auths', { params: { page_size: 1000 } })
-  vims.value = vimRes.data.items
-  loading.value = false
+  try {
+    await store.fetchInstances()
+    const pkgRes = await api.get('/catalog/vnf_packages', { params: { page_size: 1 } })
+    packages.value = pkgRes.data.items
+    const vimRes = await api.get('/vim/vim_auths', { params: { page_size: 1 } })
+    vims.value = vimRes.data.items
+  } catch (err: any) {
+    console.error('InstanceList load failed', err)
+    ElMessage.error(`加载失败: ${err?.response?.data?.detail || err?.message || '未知错误'}`)
+  } finally {
+    loading.value = false
+  }
 
   connectWebSocket((data) => {
     const idx = store.instances.findIndex((i) => i.id === data.vnf_instance_id)

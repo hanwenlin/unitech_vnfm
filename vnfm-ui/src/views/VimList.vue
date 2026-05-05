@@ -83,12 +83,18 @@ const form = ref({
 
 onMounted(async () => {
   loading.value = true
-  await fetchVims()
-  loading.value = false
+  try {
+    await fetchVims()
+  } catch (err: any) {
+    console.error('VimList load failed', err)
+    ElMessage.error(`加载失败: ${err?.response?.data?.detail || err?.message || '未知错误'}`)
+  } finally {
+    loading.value = false
+  }
 })
 
 async function fetchVims() {
-  const res = await api.get('/vim/vim_auths', { params: { page_size: 1000 } })
+  const res = await api.get('/vim/vim_auths', { params: { page_size: 1 } })
   vims.value = res.data.items
 }
 

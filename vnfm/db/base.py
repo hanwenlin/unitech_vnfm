@@ -4,6 +4,7 @@ from vnfm.db.models import (
     VnfResource,
     VimAuth,
     LifecycleEvent,
+    User,
 )
 from sqlmodel import SQLModel
 
@@ -14,4 +15,5 @@ __all__ = [
     "VnfResource",
     "VimAuth",
     "LifecycleEvent",
+    "User",
 ]

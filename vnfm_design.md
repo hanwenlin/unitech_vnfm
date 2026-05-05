@@ -456,4 +456,336 @@ vnfm-ui/
 
 
 
+ 先扫一下前后端的关键代码，再画出完整链路。
 
+  Read 10 files, listed 2 directories (ctrl+o to expand)
+
+● 我用"打开实例列表 → 看到表格"和"点'实例化' → 看到状态变绿"两个真实场景把整条链路串起来，每一步都对应到具体文件和行号。
+
+  一、应用启动期：浏览器拿到第一个 HTML 之前
+
+  浏览器输入 http://localhost:3000/
+              │
+              ▼
+  [Vite Dev Server :3000]   ← npm run dev 启动的（vite.config.ts:5-19）
+     ├─ 解析 index.html，注入 main.ts 模块
+     └─ 把对 /api/* 的请求反向代理到 :8000
+
+  vnfm-ui/src/main.ts:7-20 启动 Vue：
+  const app = createApp(App)
+  app.use(createPinia())   // 全局状态管理
+  app.use(router)          // 路由
+  app.use(ElementPlus)     // UI 组件
+  app.mount('#app')
+
+  App.vue 只有一个 <router-view />，由路由决定渲染哪个页面。
+
+  二、登录链路：拿到 token 并存好
+
+  [Login.vue handleLogin]
+     │ 用户点登录
+     ▼
+  auth.login('admin','admin')        ← store/auth.ts:9-20
+     │ axios.post('/auth/login', form)
+     ▼
+  [axios 实例 api]                    ← api/index.ts:4-7
+     │ baseURL: '/api/v1' → 实际 URL: /api/v1/auth/login
+     ▼
+  [Vite Proxy]                        ← vite.config.ts:8-12
+     │ http://localhost:3000/api/v1/auth/login
+     │   → 转发到 http://localhost:8000/api/v1/auth/login
+     ▼
+  [FastAPI 路由 auth.login()]         ← vnfm/api/routes/auth.py:46-67
+     │ 查 users 表 + bcrypt.checkpw
+     │ jwt.encode({sub, role, tenant_id}, secret_key)
+     ▼
+  返回 {"access_token":"eyJ...","token_type":"bearer"}
+     │
+     ▼
+  auth.token.value = res.data.access_token
+  localStorage.setItem('token', ...)   ← 持久化到浏览器
+  router.push('/')                    ← 跳转到首页
+
+  三、读场景：进入实例列表页 → 表格显示数据
+
+  1️⃣ 路由守卫先放行
+
+  router/index.ts:29-36：
+  router.beforeEach((to, from, next) => {
+    if (to.meta.requiresAuth && !auth.token) next('/login')
+    else next()
+  })
+  /instances 路由有 requiresAuth，但 token 已经在 localStorage 里，直接放行。
+
+  2️⃣ 组件挂载，触发数据请求
+
+  InstanceList.vue:92-107：
+  onMounted(async () => {
+    loading.value = true
+    await store.fetchInstances()    // ★ 触发请求
+    ...
+    connectWebSocket((data) => { ... })   // 同时打开 WS
+  })
+
+  3️⃣ Pinia store 调 axios
+
+  store/vnf.ts:35-39：
+  async function fetchInstances(page = 1, pageSize = 20) {
+    const res = await api.get('/vnflcm/vnf_instances', { params: { page, page_size: pageSize } })
+    instances.value = res.data.items
+    total.value = res.data.total
+  }
+
+  4️⃣ axios 请求拦截器自动塞 token
+
+  api/index.ts:9-15：
+  api.interceptors.request.use((config) => {
+    const auth = useAuthStore()
+    if (auth.token) config.headers.Authorization = `Bearer ${auth.token}`
+    return config
+  })
+  此时浏览器实际发出的是：
+  GET http://localhost:3000/api/v1/vnflcm/vnf_instances?page=1&page_size=20
+  Authorization: Bearer eyJhbGc...
+
+  5️⃣ Vite 反向代理转发到后端
+
+  浏览器 → 3000 → Vite proxy → 8000
+    GET /api/v1/vnflcm/vnf_instances?page=1&page_size=20
+    Authorization: Bearer eyJ...
+
+  6️⃣ FastAPI 中间件链 + 依赖解析
+
+  请求进 FastAPI 后按这个顺序处理（vnfm/main.py:74-78）：
+
+  [请求]
+     │
+     ▼
+  [CORSMiddleware]              处理跨域头
+     │
+     ▼
+  [AuditMiddleware]             记录方法/路径/耗时（audit.py:9-21）
+     │
+     ▼
+  [TenantMiddleware]            从 JWT 解出 tenant_id 挂到 request.state（tenant.py:13-29）
+     │
+     ▼
+  [路由匹配]  → /api/v1/vnflcm/vnf_instances
+     │
+     ▼
+  [Depends 解析]
+     ├─ get_db()                打开 AsyncSession
+     └─ get_current_user(token, db)
+          ├─ OAuth2PasswordBearer 提取 Bearer token
+          ├─ decode_token() 验签
+          └─ DB 查 users 表，校验 is_active
+              返回 {id, username, role, tenant_id}
+     │
+     ▼
+  [路由处理函数 list_vnf_instances]   ← vnf_lcm.py:65-88
+
+  7️⃣ 路由处理函数：查库
+
+  vnf_lcm.py:65-88：
+  async def list_vnf_instances(page, page_size, db, user):
+      base_query = select(VnfInstance)
+      count_query = select(func.count(VnfInstance.id))
+      if user.get("role") != "admin":
+          tenant_filter = VnfInstance.tenant_id == user.get("tenant_id")
+          base_query = base_query.where(tenant_filter)
+          count_query = count_query.where(tenant_filter)
+
+      total = (await db.execute(count_query)).scalar()
+      items = (await db.execute(
+          base_query.offset((page - 1) * page_size).limit(page_size).order_by(...)
+      )).scalars().all()
+      return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+  SQLAlchemy + asyncpg 拼出 SQL：
+  SELECT * FROM vnf_instance WHERE tenant_id='default' ORDER BY created_at DESC LIMIT 20 OFFSET 0;
+
+  8️⃣ 响应序列化
+
+  FastAPI 用 response_model=PaginatedResponse（schemas.py:138-142）：
+  - ORM 对象 → Pydantic → JSON
+  - DateTime/Enum 自动转字符串
+  - 自动添加 Content-Type: application/json
+
+  9️⃣ 响应链回传
+
+  [路由] → [Tenant MW] → [Audit MW] → [CORS MW] → [Vite Proxy] → 浏览器
+                                                                      │
+                                                                      ▼
+                                                                axios resolve
+
+  🔟 axios 响应拦截器
+
+  api/index.ts:17-27：
+  api.interceptors.response.use(
+    (res) => res,                         // 正常返回直接给到调用方
+    (err) => {
+      if (err.response?.status === 401) { // 401 自动登出
+        useAuthStore().logout()
+        window.location.href = '/login'
+      }
+      return Promise.reject(err)
+    }
+  )
+
+  1️⃣1️⃣ Pinia 写入 → Vue 响应式重渲染
+
+  instances.value = res.data.items   // ref 写入触发依赖追踪
+  - Pinia 内部用 ref() 存数据 → Vue 知道哪些组件依赖了它
+  - <el-table :data="store.instances"> 是依赖者
+  - 数据变 → 触发组件 update() → 虚拟 DOM diff → 真实 DOM 更新
+
+  页面表格出现数据，全程在浏览器视角通常 30-100ms 完成。
+
+  四、写场景：点"实例化" → 状态由 PENDING 变 ACTIVE
+
+  这条链路特殊在异步：HTTP 立即返回，状态通过 WebSocket 推回来。
+
+  [InstanceList.vue 实例化按钮]                            [前端]
+     │ instantiate(row)
+     ▼
+  api.post(`/vnflcm/vnf_instances/${id}/instantiate`)
+     │ Axios + token + Vite proxy
+     ▼ POST /api/v1/vnflcm/vnf_instances/{id}/instantiate
+  ─────────────────────────────────────────────────────────────
+  [FastAPI instantiate_vnf]                                 [后端 API]
+     │ get_current_user, _ensure_tenant_access, 装载 instance
+     ▼
+  [VnfLcmManager.instantiate]                  ← services/vnf_lcm.py:48-71
+     │ @check_vnf_state 校验状态机入口（PENDING）
+     │ _enqueue() 把任务序列化成 JSON
+     ▼
+  [RabbitMQ vnfm.tasks 队列]
+     │ 消息 = {vnf_instance_id, operation:"INSTANTIATE", user_id, tenant_id, params}
+     ▼
+  HTTP 202 立即返回 {"status":"accepted"}
+     ↑ 此时前端立即提示"实例化指令已下发"
+  ─────────────────────────────────────────────────────────────
+  [Conductor Worker]                                        [Worker 进程]
+     │ basic.consume 触发 _on_message → _process_task
+     │ _authorize_task 二次校验 user/tenant
+     │ FSM: PENDING → SPAWNING (DB commit)
+     ▼
+     _publish_result(vnf_id, "SPAWNING", tenant_id) → vnfm.results fanout
+     │
+     ▼
+     调 K8s/OpenStack 驱动（耗时几秒到几分钟）
+     │
+     ▼
+     FSM: SPAWNING → ACTIVE (DB commit)
+     instance.instantiation_state = "INSTANTIATED"
+     │
+     ▼
+     _publish_result(vnf_id, "ACTIVE", tenant_id)
+  ─────────────────────────────────────────────────────────────
+  [ws.py /events]                                           [API 进程的 WS 端点]
+     │ 异步迭代 vnfm.results 临时队列
+     │ 按 tenant 过滤后 websocket.send_json
+     ▼
+  ─────────────────────────────────────────────────────────────
+  [Vite Proxy /api/v1/ws → 8000]
+     │ ws.onmessage
+     ▼
+  [InstanceList.vue:101-106]                                [前端]
+     connectWebSocket((data) => {
+       const idx = store.instances.findIndex(i => i.id === data.vnf_instance_id)
+       if (idx !== -1) store.instances[idx].task_state = data.state
+     })
+     │ Pinia 数组元素的属性变更 → Vue 响应式
+     ▼
+     <StatusBadge :state="row.task_state" /> 重新渲染
+     │
+     ▼
+     呼吸灯：蓝（PROCESSING）→ 绿（ACTIVE）
+
+  五、关键节点与错误传播
+
+  ┌─────────────────┬─────────────────────────────────────────────┬────────────────────────────────────────────┐
+  │    异常环节     │              用户能看到的现象               │                 排查切入点                 │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ Vite proxy 没起 │ "Network Error"                             │ npm run dev / vite.config.ts               │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ token 失效/过期 │ 自动跳 /login                               │ api/index.ts:20-23 401 拦截器              │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ 后端中间件抛错  │ 500 + 控制台堆栈                            │ uvicorn 日志 + AuditMiddleware 打的 RECORD │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ FSM 状态冲突    │ toast "VNF instance has invalid state"      │ VnfInstanceConflictState → 409             │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ RabbitMQ 挂了   │ _enqueue 抛 ConnectionError → 500           │ docker logs vnfm-rabbitmq                  │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ Worker 没起     │ 请求 202 成功，但状态永远停在 PENDING       │ python -m vnfm.conductor.worker            │
+  ├─────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ WS 连不上       │ 实例化按下后状态不动，刷新页面才看到 ACTIVE │ F12 Network → WS 看 1006/1008              │
+  └─────────────────┴─────────────────────────────────────────────┴────────────────────────────────────────────┘
+
+  六、本项目里值得注意的两处细节
+
+  1️⃣ Vite 代理把整条链对前端伪装成"同源"
+
+  前端请求的 URL 是 /api/v1/...，浏览器看到的源是 localhost:3000，但 Vite 内部转发到
+  localhost:8000。所以生产环境部署时不能再依赖 Vite 代理，要把前后端用 nginx 或别的反向代理拼到同一个域名/路径下。
+
+  2️⃣ 当前 ws.ts 没把 token 加上 —— 是个待修 bug
+
+  我之前给 ws.py 加了 ?token= 必填校验，但 vnfm-ui/src/api/ws.ts:6 还在用：
+  const url = `${protocol}//${window.location.host}/api/v1/ws/events`
+
+  这导致前端连 WS 会立刻收到 1008 close。改一行就行：
+  const auth = useAuthStore()
+  const url = `${protocol}//${window.location.host}/api/v1/ws/events?token=${auth.token}`
+
+  需要我顺手把这个 bug 修了吗？
+
+  七、一图总览
+
+                      ┌──────────────── Vue 3 Browser ────────────────┐
+                      │                                                │
+     localStorage ◀──▶ Pinia auth/vnf store ◀──▶ Component (.vue)     │
+                      │           ▲                     ▲             │
+                      │           │                     │              │
+                      │           │ ws.onmessage        │ axios.get/post│
+                      │   ws.ts (WebSocket)      api/index.ts (axios) │
+                      └──────────│─────────────────────│──────────────┘
+                                ws://                  http://
+                         :3000/api/v1/ws            :3000/api/v1
+                                │                      │
+                         Vite proxy(:3000)        Vite proxy(:3000)
+                                │                      │
+                                ▼                      ▼
+                      ┌─────────────── FastAPI :8000 ────────────────┐
+                      │   CORS → Audit → Tenant → Router             │
+                      │            │                                  │
+                      │            │ Depends(get_current_user)        │
+                      │            │     └─ JWT decode + DB User查    │
+                      │            ▼                                  │
+                      │  ┌──────────────────┐    ┌────────────────┐  │
+                      │  │ /vnflcm/* /catalog│    │ /ws/events     │  │
+                      │  │ /vim/* /auth/*    │    │ (WebSocket)    │  │
+                      │  └────┬─────────────┘    └────┬───────────┘  │
+                      │       │ DB 查/写              │ 读 vnfm.results│
+                      │       ▼                       ▼              │
+                      │  ┌─────────────┐    ┌─────────────────┐      │
+                      │  │ PostgreSQL  │    │  RabbitMQ       │      │
+                      │  └─────────────┘    │  vnfm.tasks Q   │      │
+                      │                     │  vnfm.results E │      │
+                      │                     └────┬────────────┘      │
+                      └──────────────────────────│───────────────────┘
+                                                 │ basic.consume
+                                                 ▼
+                                          ┌─────────────┐
+                                          │ Conductor   │
+                                          │ Worker      │
+                                          │ (FSM+Driver)│
+                                          └──────┬──────┘
+                                                 │ 调 K8s/OpenStack
+                                                 ▼
+                                            [真实基础设施]
+
+  简而言之：Vue 写状态 → axios 拦截器加 token → Vite proxy → FastAPI 中间件 + Depends 链 → 路由查/写库 → 响应反向回传 →
+  Pinia 写值 → Vue 响应式重渲染；写操作还多一条 RabbitMQ → Worker → 状态变更 → WebSocket 推回的"异步回环"。
+
+✻ Brewed for 2m 9s

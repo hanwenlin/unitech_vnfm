@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: vnfm
       POSTGRES_DB: vnfm
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -49,6 +49,9 @@ services:
       VNFM_DATABASE_URL: postgresql+asyncpg://vnfm:vnfm@postgres:5432/vnfm
       VNFM_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       VNFM_REDIS_URL: redis://redis:6379/0
+      VNFM_SECRET_KEY: ${VNFM_SECRET_KEY}
+      VNFM_BOOTSTRAP_ADMIN_PASSWORD: ${VNFM_BOOTSTRAP_ADMIN_PASSWORD:-admin}
+      VNFM_BOOTSTRAP_ADMIN_TENANT: ${VNFM_BOOTSTRAP_ADMIN_TENANT:-default}
     ports:
       - "8000:8000"
     depends_on:
@@ -69,6 +72,7 @@ services:
       VNFM_DATABASE_URL: postgresql+asyncpg://vnfm:vnfm@postgres:5432/vnfm
       VNFM_RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       VNFM_REDIS_URL: redis://redis:6379/0
+      VNFM_SECRET_KEY: ${VNFM_SECRET_KEY}
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,18 +1,17 @@
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from aio_pika import connect_robust, Message, ExchangeType
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from vnfm.common.settings import settings
-from vnfm.common.constants import TaskState, LcmOperationStatus
+from vnfm.common.constants import LcmOperationStatus
 from vnfm.conductor.fsm import VnfFsm, FSMEvent
 from vnfm.drivers.manager import vim_manager
 from vnfm.db.session import AsyncSessionLocal
-from vnfm.db.models import VnfInstance, LifecycleEvent, VnfResource
+from vnfm.db.models import VnfInstance, LifecycleEvent, User
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +45,34 @@ class ConductorManager:
             except Exception as e:
                 logger.exception("Failed to process task: %s", e)
 
+    async def _authorize_task(self, session, instance: VnfInstance, task: Dict[str, Any]) -> bool:
+        """Defense-in-depth: verify the task's actor and tenant still match the VNF."""
+        task_user_id = task.get("user_id")
+        task_tenant_id = task.get("tenant_id")
+
+        if instance.tenant_id and task_tenant_id and instance.tenant_id != task_tenant_id:
+            logger.error(
+                "Tenant mismatch on task for instance %s: instance=%s task=%s",
+                instance.id, instance.tenant_id, task_tenant_id,
+            )
+            return False
+
+        if not task_user_id:
+            return True
+
+        user_result = await session.execute(select(User).where(User.username == task_user_id))
+        actor = user_result.scalar_one_or_none()
+        if not actor or not actor.is_active:
+            logger.error("Task actor missing or inactive: %s", task_user_id)
+            return False
+        if actor.role != "admin" and instance.tenant_id and actor.tenant_id != instance.tenant_id:
+            logger.error(
+                "Actor %s (tenant=%s) cannot operate on VNF tenant=%s",
+                task_user_id, actor.tenant_id, instance.tenant_id,
+            )
+            return False
+        return True
+
     async def _process_task(self, task: Dict[str, Any]):
         vnf_id = task["vnf_instance_id"]
         operation = task["operation"]
@@ -60,6 +87,10 @@ class ConductorManager:
             instance = result.scalar_one_or_none()
             if not instance:
                 logger.error("VNF instance not found: %s", vnf_id)
+                return
+
+            if not await self._authorize_task(session, instance, task):
+                await self._publish_result(vnf_id, "ERROR", instance.tenant_id)
                 return
 
             event = FSMEvent(operation)
@@ -79,6 +110,7 @@ class ConductorManager:
             await session.commit()
             await session.refresh(lifecycle)
 
+            result_data: Any = None
             try:
                 vim_type = instance.vim.vim_type.value if instance.vim else "KUBERNETES"
                 driver_method = VnfFsm.get_driver_method(event)
@@ -102,12 +134,16 @@ class ConductorManager:
                 lifecycle.error = str(e)
 
             await session.commit()
-            await self._publish_result(vnf_id, instance.task_state.value)
+            await self._publish_result(vnf_id, instance.task_state.value, instance.tenant_id)
 
-    async def _publish_result(self, vnf_id: str, state: str):
+    async def _publish_result(self, vnf_id: str, state: str, tenant_id: Optional[str] = None):
         exchange = await self.channel.get_exchange(self.RESULT_EXCHANGE)
         message = Message(
-            json.dumps({"vnf_instance_id": vnf_id, "state": state}).encode(),
+            json.dumps({
+                "vnf_instance_id": vnf_id,
+                "state": state,
+                "tenant_id": tenant_id,
+            }).encode(),
             content_type="application/json",
         )
         await exchange.publish(message, routing_key="")

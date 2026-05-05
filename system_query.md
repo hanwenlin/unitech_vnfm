@@ -1289,3 +1289,168 @@ class AuditMiddleware(BaseHTTPMiddleware):
   最核心的判断标准：如果明天有运营商客户要签合同，高可用、可观测性、安全合规 三项缺一不可，否则连
   POC（概念验证）都过不了。
 
+
+
+在 L-VNFM 项目中，CSRF 防护策略取决于 JWT 的存储和传递方式。以下是针对该项目架构的完整防护方案：
+
+  ---
+  核心判断：JWT Bearer Token 天然免疫 CSRF
+
+  根据项目设计，认证采用 JWT Token 并通过 Authorization: Bearer <token> 请求头传递。这种情况下：
+
+  - CSRF 攻击无效：浏览器不会自动携带自定义 Header，恶意网站无法伪造带有正确 Authorization 头的请求
+  - 前提条件：前端不能将 JWT 存入 Cookie，必须通过内存（Pinia Store）或 localStorage 保存
+
+  // 前端 Axios 正确做法（安全）
+  const api = axios.create({
+    baseURL: '/api/v1',
+    headers: {
+      'Authorization': `Bearer ${piniaStore.token}` // 从内存读取
+    }
+  });
+
+  ---
+  如果 JWT 必须存入 Cookie（如需要 HttpOnly 防 XSS）
+
+  若出于 XSS 防护考虑，将 JWT 存入 HttpOnly Cookie，则必须启用以下 三层 CSRF 防护：
+
+  1. SameSite Cookie 属性（第一道防线）
+
+  # FastAPI 设置 Cookie 时
+  response.set_cookie(
+      key="access_token",
+      value=token,
+      httponly=True,
+      secure=True,        # 仅 HTTPS 传输
+      samesite="Lax"      # 或 Strict，禁止跨站携带
+  )
+
+  - Strict：完全禁止跨站携带，但直接点击外部链接登录态会丢失（用户体验差）
+  - Lax：允许安全 HTTP 方法（GET/HEAD/OPTIONS）跨站，但 POST/DELETE/PUT 等变更操作禁止携带（推荐）
+
+  ▎ VNFM 场景建议：使用 Lax。因为 VNFM 的操作全是 POST/DELETE（创建/删除 VNF），这些会被 Lax 拦截，而 GET
+  ▎ 查询类请求允许。
+
+  ---
+  2. CORS 白名单严格限制（第二道防线）
+
+  # vnfm/api/main.py
+  from fastapi.middleware.cors import CORSMiddleware
+
+  app.add_middleware(
+      CORSMiddleware,
+      allow_origins=["https://vnfm.company.com"],  # 绝对禁止 allow_origins=["*"]
+      allow_credentials=True,  # 允许携带 Cookie
+      allow_methods=["GET", "POST", "PUT", "DELETE"],
+      allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
+  )
+
+  关键限制：
+  - allow_origins 必须是精确域名，不能是 *
+  - 生产环境通过配置中心读取白名单，禁止硬编码
+
+  ---
+  3. CSRF Token 双重验证（第三道防线）
+
+  对于 VNF 高危操作（Terminate/Delete/Scale），增加 CSRF Token 校验：
+
+  后端实现
+
+  # vnfm/api/middleware/csrf.py
+  import secrets
+  from fastapi import Request, HTTPException
+  from starlette.middleware.base import BaseHTTPMiddleware
+
+  class CSRFProtectionMiddleware(BaseHTTPMiddleware):
+      async def dispatch(self, request: Request, call_next):
+          # 仅对状态变更操作校验
+          if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+              # 1. 从 Cookie 读取服务端颁发的 CSRF Token
+              csrf_cookie = request.cookies.get("csrf_token")
+              # 2. 从 Header 读取前端提交的 CSRF Token
+              csrf_header = request.headers.get("X-CSRF-Token")
+
+              if not csrf_cookie or not csrf_header:
+                  raise HTTPException(status_code=403, detail="CSRF token missing")
+
+              if not secrets.compare_digest(csrf_cookie, csrf_header):
+                  raise HTTPException(status_code=403, detail="CSRF token mismatch")
+
+          response = await call_next(request)
+
+          # 首次访问或刷新时下发新的 CSRF Token
+          if "csrf_token" not in request.cookies:
+              response.set_cookie(
+                  key="csrf_token",
+                  value=secrets.token_urlsafe(32),
+                  httponly=False,  # 前端 JS 需要读取并放入 Header
+                  secure=True,
+                  samesite="Strict"
+              )
+          return response
+
+  前端配合（Axios 拦截器）
+
+  // vnfm-ui/src/api/request.js
+  axios.interceptors.request.use(config => {
+    // 从 Cookie 读取 CSRF Token（非 HttpOnly）
+    const csrfToken = document.cookie
+      .split('; ')
+      .find(row => row.startsWith('csrf_token='))
+      ?.split('=')[1];
+
+    if (csrfToken && ['post', 'put', 'delete', 'patch'].includes(config.method)) {
+      config.headers['X-CSRF-Token'] = csrfToken;
+    }
+    return config;
+  });
+
+  ---
+  VNFM 场景的特别加固
+
+  由于 L-VNFM 操作的是 电信级网络功能（删除 VNF 可能导致业务中断），建议增加 操作级二次确认：
+
+  敏感操作二次确认机制
+
+  # vnfm/api/routes/vnf_lcm.py
+  from fastapi import Depends, Header
+
+  @router.post("/vnf/{vnf_id}/terminate")
+  async def terminate_vnf(
+      vnf_id: str,
+      x_confirmation_token: str = Header(None),  # 额外确认令牌
+      current_user: User = Depends(get_current_user)
+  ):
+      # 高危操作需额外确认 Token（从前端二次弹窗获取）
+      if not x_confirmation_token:
+          raise HTTPException(428, "Confirmation required for destructive operation")
+
+      # 校验 Token 是否匹配（如与 VNF ID 绑定的一次性 Token）
+      expected = generate_confirmation_token(vnf_id, current_user.id)
+      if not secrets.compare_digest(x_confirmation_token, expected):
+          raise HTTPException(403, "Invalid confirmation token")
+
+      # 执行终止...
+
+  前端对应交互：
+  1. 用户点击"终止 VNF"
+  2. 弹出 Modal：输入实例名确认（如 GitHub 删除仓库）
+  3. 前端生成/获取 confirmation_token 并放入 Header 发送请求
+
+  ---
+  总结：生产环境推荐配置
+
+  ┌─────────────┬──────────────────────────────────────────────────────────┬──────────────────────────────┐
+  │    层级     │                           措施                           │           适用场景           │
+  ├─────────────┼──────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 首选        │ JWT 存内存/localStorage，通过 Authorization: Bearer 传递 │ 本项目默认方案，无 CSRF 风险 │
+  ├─────────────┼──────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ Cookie 方案 │ HttpOnly + Secure + SameSite=Lax                         │ 需要防 XSS 窃取 Token 时     │
+  ├─────────────┼──────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 增强校验    │ CORS 严格白名单 + CSRF Token 双重验证                    │ Cookie 方案下的必选项        │
+  ├─────────────┼──────────────────────────────────────────────────────────┼──────────────────────────────┤
+  │ 业务层      │ 高危操作（Terminate/Delete）二次确认 Token               │ 电信级 VNFM 强烈推荐         │
+  └─────────────┴──────────────────────────────────────────────────────────┴──────────────────────────────┘
+
+  一句话建议：L-VNFM 保持 JWT 走 Header 的设计即可规避 CSRF；如果一定要改 Cookie，必须同时启用 SameSite=Lax + CSRF Token
+   + 严格 CORS。
