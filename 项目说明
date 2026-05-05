@@ -674,3 +674,6 @@ J:\tacker_develepment\unitech_vnfm\vnfm\api\routes\ws.py这个目录是发送web
   连接由前端发起，但建立后是后端主动 push 业务事件给前端。之所以要用 WebSocket 而不是 HTTP，正是因为 HTTP
   服务端不能主动给客户端发消息（除了 SSE，单向，且没那么灵活），而 VNF 实例化是异步耗时操作（Conductor
   在后台跑可能几十秒到几分钟），后端必须有办法在状态变化时立即通知前端，不让用户疯狂 F5。
+
+
+  项目从部署到完成
